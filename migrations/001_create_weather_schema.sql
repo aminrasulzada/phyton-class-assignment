@@ -8,17 +8,17 @@
 --   derived per-day rollup            -> daily_weather
 --
 -- Applied once by pipeline.py and recorded in schema_migrations.
-
+-- Do not put BEGIN/COMMIT in here: the runner wraps the file in a transaction.
 
 CREATE TABLE IF NOT EXISTS locations (
     id              INTEGER PRIMARY KEY,
     name            TEXT    NOT NULL,
-    latitude        REAL    NOT NULL CHECK (latitude  BETWEEN -90  AND 90),   
-    longitude       REAL    NOT NULL CHECK (longitude BETWEEN -180 AND 180), 
+    latitude        REAL    NOT NULL CHECK (latitude  BETWEEN -90  AND 90),   -- as requested
+    longitude       REAL    NOT NULL CHECK (longitude BETWEEN -180 AND 180),  -- as requested
     grid_latitude   REAL,   -- centre of the model grid cell Open-Meteo actually used
     grid_longitude  REAL,
     elevation_m     REAL,
-    UNIQUE (latitude, longitude)                                               
+    UNIQUE (latitude, longitude)                                               -- natural key
 );
 
 CREATE TABLE IF NOT EXISTS weather_codes (
@@ -59,8 +59,8 @@ ON CONFLICT (code) DO UPDATE SET description = excluded.description;
 
 CREATE TABLE IF NOT EXISTS hourly_weather (
     location_id             INTEGER NOT NULL REFERENCES locations (id) ON DELETE CASCADE,
-    observed_at             TEXT    NOT NULL,  
-    observed_date           TEXT    NOT NULL,  
+    observed_at             TEXT    NOT NULL,  -- ISO-8601 UTC, e.g. 2024-05-01T13:00:00Z
+    observed_date           TEXT    NOT NULL,  -- YYYY-MM-DD (UTC), derived
     observed_hour           INTEGER NOT NULL CHECK (observed_hour BETWEEN 0 AND 23),
     temperature_c           REAL    CHECK (temperature_c BETWEEN -90 AND 60),
     relative_humidity_pct   INTEGER CHECK (relative_humidity_pct BETWEEN 0 AND 100),

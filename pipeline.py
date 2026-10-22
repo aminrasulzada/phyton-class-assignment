@@ -10,6 +10,8 @@ Open-Meteo -> SQLite weather pipeline (standard library only).
              derive date / hour / compass direction.
   Load       upsert into SQLite, one transaction per location, then rebuild the
              daily aggregates for the loaded window.
+  Quality    run the rules in quality_checks.py over the whole database, store
+             every violating row in quality_data_stat, and write a Markdown report.
 
 Why it is idempotent (running it twice gives the same database):
   * migrations are recorded in schema_migrations and applied exactly once
@@ -18,12 +20,16 @@ Why it is idempotent (running it twice gives the same database):
   * transforms are pure and deterministic: no now(), no random ids, sorted output
   * all writes for a location commit atomically, so a crash never leaves
     half-loaded data that a re-run would have to work around
+  * quality_data_stat is synced to the current violations (fixed ones removed,
+    unchanged ones untouched) and the report contains no wall-clock time
 
 Usage:
   python pipeline.py
   python pipeline.py --start-date 2024-01-01 --end-date 2024-01-31 \\
       --location "Berlin:52.52:13.41" --location "Paris:48.8566:2.3522"
   python pipeline.py --input-json saved_response.json   # offline, one location
+  python pipeline.py --checks-only                      # re-run quality checks only
+  python pipeline.py --fail-on-error                    # exit 2 if an error rule fails (CI)
 """
 from __future__ import annotations
 
@@ -43,6 +49,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+
+import quality_checks
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
@@ -339,8 +347,19 @@ def load(conn: sqlite3.Connection, loc: Location, payload: dict,
 Fetcher = Callable[[Location, date, date], dict]
 
 
+@dataclass
+class RunResult:
+    cleaning: dict[str, Counter]                       # transform stats per location
+    quality: list[quality_checks.RuleResult]           # one result per quality rule
+
+    @property
+    def quality_status(self) -> str:
+        return quality_checks.overall_status(self.quality)
+
+
 def run(db_path: str | Path, locations: list[Location], start: date, end: date,
-        fetch: Fetcher = fetch_hourly) -> dict[str, Counter]:
+        fetch: Fetcher = fetch_hourly, *, report_path: str | Path | None = None,
+        checks_only: bool = False) -> RunResult:
     if start > end:
         raise ValueError(f"start date {start} is after end date {end}")
 
@@ -349,16 +368,33 @@ def run(db_path: str | Path, locations: list[Location], start: date, end: date,
         conn.execute("PRAGMA foreign_keys = ON")
         apply_migrations(conn)
         valid_codes = {c for (c,) in conn.execute("SELECT code FROM weather_codes")}
-        report: dict[str, Counter] = {}
+        cleaning: dict[str, Counter] = {}
 
-        for loc in locations:
+        for loc in [] if checks_only else locations:
             payload = fetch(loc, start, end)                 # network happens outside any transaction
             rows, stats = transform(payload, start, end, valid_codes)
             with conn:                                       # atomic: commit all or roll back all
                 load(conn, loc, payload, rows, start, end)
             log.info("%s %s..%s: %s", loc.name, start, end, dict(sorted(stats.items())))
-            report[loc.name] = stats
-        return report
+            cleaning[loc.name] = stats
+
+        quality = quality_checks.run_quality_checks(conn)
+        result = RunResult(cleaning, quality)
+        failing = [f"{r.rule.rule_id}={r.violations}" for r in quality if r.violations]
+        log.info("data quality %s (%d rules; violations: %s)",
+                 result.quality_status, len(quality), ", ".join(failing) or "none")
+
+        if report_path is not None:
+            report = quality_checks.render_report(
+                quality,
+                db_path=str(db_path),
+                window=None if checks_only else (start, end),
+                locations=[] if checks_only else [loc.name for loc in locations],
+                cleaning=cleaning,
+            )
+            Path(report_path).write_text(report, encoding="utf-8")
+            log.info("wrote data quality report to %s", report_path)
+        return result
     finally:
         conn.close()
 
@@ -376,6 +412,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--end-date", type=date.fromisoformat, default=default_end)
     parser.add_argument("--input-json", type=Path,
                         help="use a saved API response instead of calling the API (one location only)")
+    parser.add_argument("--report", type=Path, default=Path("data_quality_report.md"),
+                        help="where to write the data quality report (default: data_quality_report.md)")
+    parser.add_argument("--checks-only", action="store_true",
+                        help="skip extract/load and only run the quality checks on the existing database")
+    parser.add_argument("--fail-on-error", action="store_true",
+                        help="exit with status 2 if any error-severity quality rule has violations")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -391,10 +433,14 @@ def main(argv: list[str] | None = None) -> int:
         fetch = lambda *_: saved  # noqa: E731
 
     try:
-        run(args.db, locations, args.start_date, args.end_date, fetch)
+        result = run(args.db, locations, args.start_date, args.end_date, fetch,
+                     report_path=args.report, checks_only=args.checks_only)
     except (RuntimeError, ValueError, sqlite3.Error) as exc:
         log.error("pipeline failed: %s", exc)
         return 1
+    if args.fail_on_error and result.quality_status == "FAIL":
+        log.error("error-severity data quality rules failed; see %s", args.report)
+        return 2
     return 0
 
 
