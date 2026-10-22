@@ -74,11 +74,12 @@ class PipelineTest(unittest.TestCase):
     def test_migrations_are_applied_once(self):
         self.run_pipeline()
         self.run_pipeline()
-        self.assertEqual(self.query("SELECT version FROM schema_migrations"),
-                         [{"version": "001_create_weather_schema.sql"}])
+        self.assertEqual(self.query("SELECT version FROM schema_migrations ORDER BY version"),
+                         [{"version": "001_create_weather_schema.sql"},
+                          {"version": "002_create_quality_tables.sql"}])
 
     def test_cleaning_rules(self):
-        stats = self.run_pipeline()["Berlin"]
+        stats = self.run_pipeline().cleaning["Berlin"]
         rows = {r["observed_at"]: r for r in self.query("SELECT * FROM hourly_weather")}
 
         self.assertEqual(len(rows), 47)
